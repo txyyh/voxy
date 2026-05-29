@@ -4,6 +4,8 @@ import me.cortex.voxy.commonImpl.VoxyCommon;
 import me.cortex.voxy.server.worldgen.ChunkGenerationManager;
 import me.cortex.voxy.server.worldgen.PlayerTracker;
 import me.cortex.voxy.server.worldgen.VoxyWorldGenConfig;
+import me.cortex.voxy.server.worldgen.PlayerSyncStateStore;
+import me.cortex.voxy.server.worldgen.ServerLodPayloadStore;
 import me.cortex.voxy.server.worldgen.VoxyWorldGenNetworking;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -47,6 +49,10 @@ public final class VoxyServerLifecycle {
     private static void onServerStopping(ServerStoppingEvent event) {
         ChunkGenerationManager.getInstance().shutdown();
         PlayerTracker.getInstance().clear();
+        PlayerSyncStateStore.getInstance().saveAll(event.getServer());
+        for (ServerLevel level : event.getServer().getAllLevels()) {
+            ServerLodPayloadStore.getInstance().save(level);
+        }
         if (VoxyCommon.IS_DEDICATED_SERVER) {
             VoxyCommon.shutdownInstance();
             VoxyDedicatedServerInstance.unbindServer();
@@ -57,19 +63,30 @@ public final class VoxyServerLifecycle {
         if (!(event.getEntity() instanceof ServerPlayer player)) return;
         PlayerTracker.getInstance().addPlayer(player);
         VoxyWorldGenNetworking.sendHandshake(player);
-        // After the dimension is ready, align LOD sync state with existing players: send progress total
-        // and push voxy column data (already-generated chunks do not re-fire ChunkEvent.Load for joiners).
+        // Force a full sync on every login: the client’s LOD cache is in-memory only
+        // and is lost on disconnect, so any persisted watermark would cause us to skip
+        // columns the player never actually received.
+        PlayerSyncStateStore.getInstance().resetWatermarks(player.getUUID(), player.getServer());
         player.getServer().tell(new net.minecraft.server.TickTask(
                 player.getServer().getTickCount() + 20,
                 () -> {
                     VoxyWorldGenNetworking.sendSyncTotal(player);
-                    ChunkGenerationManager.getInstance().scheduleJoinLodResync(player.getUUID());
+                    ServerLodPayloadStore.getInstance().scheduleDeltaSync(player);
                 }));
+        // Fallback: live chunks that were never persisted (e.g. server crashed before
+        // auto-save) can still be synced from the in-world chunk data.
+        player.getServer().tell(new net.minecraft.server.TickTask(
+                player.getServer().getTickCount() + 40,
+                () -> ChunkGenerationManager.getInstance().scheduleJoinLodResync(player.getUUID())));
     }
 
     private static void onPlayerLoggedOut(PlayerEvent.PlayerLoggedOutEvent event) {
         if (!(event.getEntity() instanceof ServerPlayer player)) return;
         ChunkGenerationManager.getInstance().clearJoinResyncState(player.getUUID());
+        // Do not save the watermark: the client’s LOD cache is discarded on disconnect,
+        // so persisting it would cause the next login to receive only delta updates
+        // and miss everything that was already in the store.
+        ServerLodPayloadStore.getInstance().clearPlayer(player.getUUID());
         PlayerTracker.getInstance().removePlayer(player);
     }
 
@@ -99,6 +116,10 @@ public final class VoxyServerLifecycle {
         ChunkPos pos   = chunk.getPos();
         int minY       = chunk.getMinSection();
         var dim        = level.dimension();
+
+        // Cache for full-sync replay to new players
+        ServerLodPayloadStore.getInstance().storeColumn(dim, pos, minY, sections);
+
         for (ServerPlayer player : targets) {
             VoxyWorldGenNetworking.sendLODDataPrebuilt(player, dim, pos, minY, sections);
         }

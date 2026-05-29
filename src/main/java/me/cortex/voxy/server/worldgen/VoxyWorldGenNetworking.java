@@ -25,6 +25,10 @@ import net.neoforged.neoforge.network.PacketDistributor;
 import java.util.ArrayList;
 import java.util.List;
 
+import me.cortex.voxy.server.worldgen.ChunkGenerationManager;
+import me.cortex.voxy.server.worldgen.PlayerSyncStateStore;
+import me.cortex.voxy.server.worldgen.PlayerTracker;
+
 public final class VoxyWorldGenNetworking {
     // 256 KB per LodColumn payload — reduces packet count by ~8× vs 32 KB
     private static final int MAX_PACKET_BYTES = 262_144;
@@ -119,6 +123,33 @@ public final class VoxyWorldGenNetworking {
         public Type<? extends CustomPacketPayload> type() { return TYPE; }
     }
 
+    /**
+     * Sent from server → client when the delta sync (initial join or resync)
+     * has finished sending all batches. Carries the number of chunks synced
+     * so the client can show a completion message + toast.
+     */
+    public record SyncCompletePayload(int syncedChunks) implements CustomPacketPayload {
+        public static final CustomPacketPayload.Type<SyncCompletePayload> TYPE =
+                new CustomPacketPayload.Type<>(ResourceLocation.fromNamespaceAndPath(VoxyMod.MODID, "sync_complete"));
+        public static final StreamCodec<FriendlyByteBuf, SyncCompletePayload> STREAM_CODEC =
+                StreamCodec.of((b, v) -> b.writeVarInt(v.syncedChunks()), b -> new SyncCompletePayload(b.readVarInt()));
+
+        @Override
+        public Type<? extends CustomPacketPayload> type() { return TYPE; }
+    }
+
+    public record ClientRequestResyncPayload() implements CustomPacketPayload {
+        public static final CustomPacketPayload.Type<ClientRequestResyncPayload> TYPE =
+                new CustomPacketPayload.Type<>(ResourceLocation.fromNamespaceAndPath(VoxyMod.MODID, "client_request_resync"));
+        public static final StreamCodec<FriendlyByteBuf, ClientRequestResyncPayload> STREAM_CODEC =
+                StreamCodec.of((b, v) -> {}, b -> new ClientRequestResyncPayload());
+
+        @Override
+        public Type<? extends CustomPacketPayload> type() {
+            return TYPE;
+        }
+    }
+
     private VoxyWorldGenNetworking() {}
 
     public static void broadcastLODData(LevelChunk chunk) {
@@ -129,6 +160,9 @@ public final class VoxyWorldGenNetworking {
 
         double maxDistSq = 4096.0 * 4096.0;
         ResourceKey<Level> dim = chunk.getLevel().dimension();
+
+        // Store for full-sync replay to new players
+        ServerLodPayloadStore.getInstance().storeColumn(dim, pos, minY, sections);
 
         for (ServerPlayer player : PlayerTracker.getInstance().getPlayers()) {
             double dx = player.getX() - pos.getMiddleBlockX();
@@ -151,6 +185,8 @@ public final class VoxyWorldGenNetworking {
         ChunkPos pos = chunk.getPos();
         int minY = chunk.getMinSection();
         List<LodSectionPayload> sections = buildSections(chunk);
+        // Store for full-sync replay
+        ServerLodPayloadStore.getInstance().storeColumn(chunk.getLevel().dimension(), pos, minY, sections);
         if (sections.isEmpty()) { setSyncedState(player, pos, false); return; }
         sendSectionsInBatches(player, chunk.getLevel().dimension(), pos, minY, sections);
         setSyncedState(player, pos, true);
@@ -262,11 +298,25 @@ public final class VoxyWorldGenNetworking {
         safeSendToPlayer(player, new SyncTotalPayload(total));
     }
 
-    private static void safeSendToPlayer(ServerPlayer player, CustomPacketPayload payload) {
+    static void safeSendToPlayer(ServerPlayer player, CustomPacketPayload payload) {
         try {
             PacketDistributor.sendToPlayer(player, payload);
         } catch (Exception e) {
             Logger.error("Failed to send packet " + payload.type().id() + " to player " + player.getName().getString(), e);
         }
+    }
+
+    public static void handleClientResyncRequest(ServerPlayer player) {
+        ChunkGenerationManager mgr = ChunkGenerationManager.getInstance();
+        if (!mgr.isRunning()) return;
+        // Reset watermarks so scheduleDeltaSync sends the full store (watermark=0).
+        // resetWatermarks also deletes the file so the reset survives a crash.
+        PlayerSyncStateStore.getInstance().resetWatermarks(player.getUUID(), player.getServer());
+        var synced = PlayerTracker.getInstance().getSyncedChunks(player.getUUID());
+        if (synced != null) synced.clear();
+        // Use scheduleDeltaSync only: it replays the persistent ServerLodPayloadStore.
+        // Do NOT call scheduleJoinLodResync here — that pulls from live in-memory
+        // chunks which may differ from the stored snapshot.
+        ServerLodPayloadStore.getInstance().scheduleDeltaSync(player);
     }
 }
